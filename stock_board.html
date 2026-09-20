@@ -96,6 +96,7 @@
   .rank.top { color: var(--ink); font-weight: 700; }
   .name { font-weight: 700; font-size: 16px; overflow-wrap: anywhere; }
   .code { color: var(--muted); font-size: 12px; font-weight: 400; margin-left: 6px; }
+  .mine { margin-left: 6px; padding: 0 6px; font-size: 11px; font-weight: 500; color: var(--muted); border: 1px dashed var(--muted); border-radius: 4px; white-space: nowrap; vertical-align: 1px; }
   .sub { color: var(--muted); font-size: 13px; }
   .sub .dir { margin-left: 10px; color: var(--ink); }
   .score { font-size: 32px; line-height: 1; font-weight: 700; letter-spacing: -0.01em; }
@@ -279,7 +280,8 @@ function recordsFromCSV(text) {
       outlook: str(r, "outlook"), risk: num(r, "plateau_risk"), rising: num(r, "rising_score"),
       price: num(r, "price"), rangeLow: num(r, "range_low"), rangeHigh: num(r, "range_high"),
       wideLow: num(r, "wide_low"), wideHigh: num(r, "wide_high"),
-      direction: str(r, "direction"), newsTone: str(r, "news_tone"), marketTone: str(r, "market_tone")
+      direction: str(r, "direction"), newsTone: str(r, "news_tone"), marketTone: str(r, "market_tone"),
+      mine: num(r, "mine") === 1
     });
   }
   const valid = out.filter(x => x.ticker && x.market);
@@ -532,7 +534,7 @@ function item(r, place) {
   },
     h("span", { class: "rank" + (place <= 3 ? " top" : ""), text: String(place) }),
     h("span", null,
-      h("span", { class: "name", text: nm || r.ticker }), nm ? h("span", { class: "code", text: r.ticker }) : null, chip, h("br"),
+      h("span", { class: "name", text: nm || r.ticker }), nm ? h("span", { class: "code", text: r.ticker }) : null, r.mine ? h("span", { class: "mine", text: "自分の銘柄" }) : null, chip, h("br"),
       h("span", { class: "sub" }, sub),
       h("span", { class: "track" }, h("span", { class: "fill", style: "width:" + Math.max(0, Math.min(100, r.score ?? 0)) + "%" }))
     ),

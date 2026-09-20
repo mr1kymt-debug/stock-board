@@ -12,21 +12,27 @@
 
 総合スコア = 上昇の勢い75% + 頭打ちしにくさ25%
 
+分析する銘柄は、下の UNIVERSE（標準の20社）と、my_stocks.txt に書いた「自分の銘柄」の合計です。
+
 あくまで候補を絞り込む補助ツールで、将来の値上がりを保証するものではありません。
 """
 import datetime
 import json
 import pathlib
+import re
+import unicodedata
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
 
-# 対象銘柄（自由に追加・変更してください）。日本株は末尾に ".T"
+# 標準の対象銘柄（日米10社ずつ）。日本株は末尾に ".T"
+# 自分で足したい銘柄は、ここではなく my_stocks.txt に書くのがおすすめです
 UNIVERSE = {
-    "US": ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN"],
-    "JP": ["7203.T", "6758.T", "9984.T", "8035.T", "6861.T"],
+    "US": ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "AVGO", "JPM", "WMT"],
+    "JP": ["7203.T", "6758.T", "9984.T", "8035.T", "6861.T", "8306.T", "6501.T", "7974.T", "9983.T", "6857.T"],
 }
+MY_STOCKS_FILE = "my_stocks.txt"
 
 # 上昇の勢い（高いほど良い指標）。合計1。仮の値なので、使いながら調整してください
 WEIGHTS = {
@@ -120,6 +126,48 @@ def fetch_features(ticker: str) -> dict:
     return feats
 
 
+def normalize_code(raw: str):
+    """銘柄コードを整える。全角→半角、小文字→大文字、日本株は末尾に .T を付ける。使えない書き方は None。"""
+    code = unicodedata.normalize("NFKC", raw).strip().upper()
+    if not code:
+        return None
+    if re.fullmatch(r"\d{3}[0-9A-Z]", code):        # 日本株の4桁コード（例：7203、285A）
+        code += ".T"
+    return code if re.fullmatch(r"[0-9A-Z]{1,6}(\.T|-[A-Z])?", code) else None
+
+
+def market_of(code: str) -> str:
+    return "JP" if code.endswith(".T") else "US"
+
+
+def load_my_stocks(path=MY_STOCKS_FILE):
+    """my_stocks.txt から「自分の銘柄」を読み込む。1行に1つ。「#」から後ろはメモ。"""
+    p = pathlib.Path(path)
+    if not p.exists():
+        return []
+    codes = []
+    for line in p.read_text(encoding="utf-8-sig").splitlines():
+        line = line.replace("＃", "#").split("#", 1)[0]
+        for part in re.split(r"[,\s、，]+", line):
+            if not part:
+                continue
+            code = normalize_code(part)
+            if code is None:
+                print(f"[警告] my_stocks.txt の「{part}」は銘柄コードとして読めないため、飛ばしました。")
+            elif code not in codes:
+                codes.append(code)
+    return codes
+
+
+def build_universe(extra):
+    """標準の銘柄に、自分の銘柄を足す（重複は1つにまとめる）。"""
+    uni = {m: list(t) for m, t in UNIVERSE.items()}
+    for code in extra:
+        if code not in uni[market_of(code)]:
+            uni[market_of(code)].append(code)
+    return uni
+
+
 def load_news(path=NEWS_FILE, today=None):
     """news_view.json を読み込む。無い・古い・壊れているときは None（ニュースなしで計算）。"""
     p = pathlib.Path(path)
@@ -203,11 +251,14 @@ def build_scores(df: pd.DataFrame, news=None) -> pd.DataFrame:
 
 def main():
     news = load_news()
+    mine = load_my_stocks()
+    if mine:
+        print(f"自分の銘柄: {', '.join(mine)}")
     rows = []
-    for market, tickers in UNIVERSE.items():
+    for market, tickers in build_universe(mine).items():
         for ticker in tickers:
             print(f"取得中: {ticker}")
-            rows.append({"ticker": ticker, "market": market, **fetch_features(ticker)})
+            rows.append({"ticker": ticker, "market": market, "mine": int(ticker in mine), **fetch_features(ticker)})
     result = build_scores(pd.DataFrame(rows).set_index("ticker"), news)
 
     pd.set_option("display.float_format", lambda x: f"{x:,.1f}")
