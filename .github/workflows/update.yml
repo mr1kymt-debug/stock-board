@@ -1,6 +1,9 @@
 name: update-stock-screener
 
 on:
+  push:
+    paths:
+      - "my_stocks.txt"      # 自分の銘柄を書き換えて保存したら、すぐ動く
   schedule:
     # 平日の22:15 UTC（日本時間の朝7:15）。米国株は前日の終値、日本株は当日の終値が反映済み
     - cron: "15 22 * * 1-5"
