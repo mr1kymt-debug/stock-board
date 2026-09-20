@@ -173,6 +173,19 @@
   .msg { min-height: 1.5em; margin: 10px 0 0; font-size: 14px; }
   .msg.err { color: var(--up); }
 
+  .star { color: var(--ink); margin-right: 6px; }
+  .fav-btn { margin: 4px 0 10px; padding: 6px 14px; font-size: 14px; }
+  .addrow { display: flex; gap: 8px; margin: 12px 0 4px; }
+  .addrow input {
+    flex: 1; min-width: 0; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line);
+    background: var(--bg); color: var(--ink); font: inherit;
+  }
+  .steps { margin: 8px 0 0; padding-left: 1.4em; font-size: 13px; color: var(--muted); }
+  .steps li { margin: 3px 0; }
+  .fav-msg { margin: 8px 0 0; font-size: 13px; }
+  .fav-msg.err { color: var(--up); }
+  .pending { padding: 14px 0; display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+
   .note { margin-top: 24px; color: var(--muted); font-size: 12px; }
 </style>
 </head>
@@ -384,10 +397,52 @@ function sampleRecords() {
   return recs;
 }
 
+/* ---- お気に入り：銘柄コードの整形と my_stocks.txt の編集（プログラム本体と同じ規則） ---- */
+function normalizeCode(raw) {
+  let c = String(raw == null ? "" : raw).normalize("NFKC").trim().toUpperCase();
+  if (!c) return null;
+  if (/^\d{3}[0-9A-Z]$/.test(c)) c += ".T";                  // 日本株の4桁コード
+  return /^[0-9A-Z]{1,6}(\.T|-[A-Z])?$/.test(c) ? c : null;
+}
+function splitBody(line) {
+  const t = line.replace("＃", "#");
+  const i = t.indexOf("#");
+  return { body: i >= 0 ? t.slice(0, i) : t, comment: i >= 0 ? t.slice(i) : "" };
+}
+function parseMyStocks(text) {
+  const codes = [];
+  for (const line of String(text || "").split(/\r?\n/)) {
+    for (const part of splitBody(line).body.split(/[,\s、，]+/)) {
+      const c = part ? normalizeCode(part) : null;
+      if (c && !codes.includes(c)) codes.push(c);
+    }
+  }
+  return codes;
+}
+function addToMyStocks(text, code) {
+  if (parseMyStocks(text).includes(code)) return text;
+  let t = String(text || "");
+  if (t && !t.endsWith("\n")) t += "\n";
+  return t + code + "\n";
+}
+function removeFromMyStocks(text, code) {
+  const out = [];
+  for (const line of String(text || "").split(/\r?\n/)) {
+    const { body, comment } = splitBody(line);
+    const parts = body.split(/[,\s、，]+/).filter(Boolean);
+    if (!parts.some(p => normalizeCode(p) === code)) { out.push(line); continue; }
+    const rest = parts.filter(p => normalizeCode(p) !== code);
+    if (rest.length) out.push(rest.join(" ") + (comment ? "   " + comment : ""));   // 他のコードが残る行だけ残す
+  }
+  return out.join("\n");
+}
+
 /* ---- ui ---- */
 const STORE_KEY = "screener:v1";
 const NEWS_KEY = "screener:news:v1";
-const state = { records: [], byMarket: {}, market: null, open: null, source: "sample", updatedAt: null, news: null };
+const state = { records: [], byMarket: {}, market: null, open: null, source: "sample", updatedAt: null, news: null, fav: [], favSeeded: false, favStored: false, favMsg: null, gh: null };
+const FAV_KEY = "screener:fav:v1";
+const GH_KEY = "screener:gh:v1";
 let dbRef = null;
 
 function h(tag, props, ...kids) {
@@ -426,8 +481,12 @@ function setRecords(records, source, updatedAt) {
   state.source = source;
   state.updatedAt = updatedAt || null;
   const markets = Object.keys(state.byMarket);
-  if (state.market !== "news" && !markets.includes(state.market)) state.market = markets.includes("JP") ? "JP" : markets[0];
+  if (state.market !== "news" && state.market !== "fav" && !markets.includes(state.market)) state.market = markets.includes("JP") ? "JP" : markets[0];
   state.open = null;
+  if (source === "csv" && !state.favSeeded) {   // 初回だけ、分析に入っている「自分の銘柄」をお気に入りの初期値にする
+    state.favSeeded = true;
+    if (!state.favStored) { state.fav = records.filter(r => r.mine).map(r => r.ticker); saveFav(); }
+  }
   render();
 }
 function validNews(o) { return !!(o && typeof o === "object" && o.tickers && typeof o.tickers === "object"); }
@@ -466,6 +525,10 @@ function render() {
     class: "tab", role: "tab", id: "tab-" + m, "aria-selected": String(m === state.market),
     onclick: () => { state.market = m; state.open = null; render(); }
   }, MARKET_LABEL[m] || m, h("span", { class: "n", text: String(state.byMarket[m].length) })));
+  tabEls.push(h("button", {
+    class: "tab", role: "tab", id: "tab-fav", "aria-selected": String(state.market === "fav"),
+    onclick: () => { state.market = "fav"; state.open = null; render(); }
+  }, "★お気に入り", h("span", { class: "n", text: String(state.fav.length) })));
   if (state.news) tabEls.push(h("button", {
     class: "tab", role: "tab", id: "tab-news", "aria-selected": String(state.market === "news"),
     onclick: () => { state.market = "news"; state.open = null; render(); }
@@ -477,6 +540,13 @@ function render() {
     $("list").hidden = true;
     $("newsView").hidden = false;
     renderNews();
+    return;
+  }
+  if (state.market === "fav") {
+    $("list").hidden = false;
+    $("newsView").hidden = true;
+    $("mbox").replaceChildren(...favPanels());
+    $("list").replaceChildren(...favRows());
     return;
   }
   if (state.market === "news") state.market = Object.keys(state.byMarket)[0];
@@ -534,7 +604,8 @@ function item(r, place) {
   },
     h("span", { class: "rank" + (place <= 3 ? " top" : ""), text: String(place) }),
     h("span", null,
-      h("span", { class: "name", text: nm || r.ticker }), nm ? h("span", { class: "code", text: r.ticker }) : null, r.mine ? h("span", { class: "mine", text: "自分の銘柄" }) : null, chip, h("br"),
+      isFav(r.ticker) ? h("span", { class: "star", text: "★" }) : null,
+      h("span", { class: "name", text: nm || r.ticker }), nm ? h("span", { class: "code", text: r.ticker }) : null, chip, h("br"),
       h("span", { class: "sub" }, sub),
       h("span", { class: "track" }, h("span", { class: "fill", style: "width:" + Math.max(0, Math.min(100, r.score ?? 0)) + "%" }))
     ),
@@ -593,7 +664,7 @@ function forecastBlock(r) {
 }
 
 function detail(r) {
-  const parts = [];
+  const parts = [favButton(r.ticker)];
   if (r.rising != null || r.risk != null) parts.push(h("div", { class: "sum" }, stat("上昇の勢い", r.rising), stat("頭打ちリスク", r.risk)));
   const fc = forecastBlock(r); if (fc) parts.push(...fc);
   const n = newsOf(r.ticker);
@@ -675,7 +746,199 @@ $("reset").addEventListener("click", async () => {
   say("保存データを消しました。サンプル表示に戻しています。");
 });
 
+/* ---- お気に入り（気になる銘柄）。GitHubとつなぐと、my_stocks.txt を書き換えて新しい銘柄も分析できる ---- */
+function isFav(t) { return state.fav.includes(t); }
+function saveFav() { try { localStorage.setItem(FAV_KEY, JSON.stringify(state.fav)); } catch (e) {} }
+function initFavState() {
+  try {
+    const raw = localStorage.getItem(FAV_KEY);
+    if (raw !== null) { const a = JSON.parse(raw); if (Array.isArray(a)) { state.fav = a.filter(x => typeof x === "string"); state.favStored = true; } }
+  } catch (e) {}
+  try { const g = JSON.parse(localStorage.getItem(GH_KEY) || "null"); if (g && g.token) state.gh = { token: g.token }; } catch (e) {}
+}
+function setFavMsg(text, isErr) { state.favMsg = text ? { text, err: !!isErr } : null; render(); }
+
+function ghRepo() {
+  const host = location.hostname;
+  if (!host.endsWith(".github.io")) return null;
+  const repo = location.pathname.split("/").filter(Boolean)[0];
+  return repo ? { owner: host.split(".")[0], repo } : null;
+}
+function ghConnected() { return !!(state.gh && state.gh.token && ghRepo()); }
+async function ghApi(path, opts) {
+  const r = ghRepo();
+  const o = opts || {};
+  const headers = { Accept: "application/vnd.github+json", Authorization: "Bearer " + state.gh.token, "X-GitHub-Api-Version": "2022-11-28" };
+  if (o.body) headers["Content-Type"] = "application/json";
+  return fetch("https://api.github.com/repos/" + r.owner + "/" + r.repo + path, Object.assign({}, o, { headers }));
+}
+function b64ToText(b64) {
+  const bin = atob(String(b64).replace(/\s/g, ""));
+  return new TextDecoder().decode(Uint8Array.from(bin, c => c.charCodeAt(0)));
+}
+function textToB64(t) {
+  let s = "";
+  new TextEncoder().encode(t).forEach(b => { s += String.fromCharCode(b); });
+  return btoa(s);
+}
+async function readMyStocks() {
+  const res = await ghApi("/contents/my_stocks.txt");
+  if (res.status === 404) return { text: "", sha: null };
+  if (!res.ok) { const e = new Error("http " + res.status); e.status = res.status; throw e; }
+  const j = await res.json();
+  return { text: b64ToText(j.content), sha: j.sha };
+}
+async function writeMyStocks(text, sha, message) {
+  const body = { message, content: textToB64(text) };
+  if (sha) body.sha = sha;
+  const res = await ghApi("/contents/my_stocks.txt", { method: "PUT", body: JSON.stringify(body) });
+  if (!res.ok) { const e = new Error("http " + res.status); e.status = res.status; throw e; }
+}
+async function syncOne(code, on) {
+  for (let i = 0; i < 2; i++) {                        // 同時に書き換えられて食い違ったら、1回だけやり直す
+    const { text, sha } = await readMyStocks();
+    const next = on ? addToMyStocks(text, code) : removeFromMyStocks(text, code);
+    if (next === text) return;
+    try { await writeMyStocks(next, sha, (on ? "お気に入りに追加: " : "お気に入りから削除: ") + code); return; }
+    catch (e) { if (e.status === 409 || e.status === 422) continue; throw e; }
+  }
+  throw new Error("conflict");
+}
+function ghErrorText(e) {
+  const st = e && e.status;
+  if (st === 401) return "トークンが正しくないようです。コピーし直して、もう一度お試しください。";
+  if (st === 403 || st === 404) return "GitHubに書き込む権限がないようです。トークンを作るときに、対象のリポジトリ（stock-board）を選び、「Contents」を「Read and write」にしたか確認してください。";
+  if (st) return "GitHubがエラーを返しました（" + st + "）。少し待って、もう一度お試しください。";
+  return "GitHubに接続できませんでした。通信の状態を確認して、もう一度お試しください。";
+}
+async function syncFromGitHub(silent) {
+  try {
+    const { text } = await readMyStocks();
+    state.fav = parseMyStocks(text); state.favStored = true; saveFav();
+    if (silent) render(); else setFavMsg("GitHubの内容と合わせました。");
+  } catch (e) { if (!silent) setFavMsg(ghErrorText(e), true); }
+}
+
+async function setFavorite(raw, on) {
+  const code = normalizeCode(raw);
+  if (!code) { setFavMsg("「" + raw + "」は銘柄コードとして読めません。米国株はアルファベット、日本株は数字4桁です。", true); return false; }
+  const set = new Set(state.fav);
+  if (on) set.add(code); else set.delete(code);
+  state.fav = [...set]; state.favStored = true; saveFav();
+  if (!ghConnected()) {
+    setFavMsg(on ? "この端末だけの印として保存しました。" : "お気に入りから外しました（この端末のみ）。");
+    return true;
+  }
+  setFavMsg("GitHubに保存しています…");
+  try {
+    await syncOne(code, on);
+    setFavMsg(on ? "GitHubに保存しました。数分後に、分析結果へ反映されます。" : "GitHubの一覧から外しました。標準の20社は、外しても分析を続けます。");
+  } catch (e) { setFavMsg("この端末の印は変わりましたが、GitHubへの保存に失敗しました。" + ghErrorText(e), true); }
+  return true;
+}
+function favButton(t) {
+  const on = isFav(t);
+  return h("button", { class: "btn ghost fav-btn", type: "button", onclick: () => setFavorite(t, !on) }, on ? "★ お気に入りから外す" : "☆ お気に入りに入れる");
+}
+
+async function addFromInput(inputEl) {
+  const parts = (inputEl.value || "").split(/[,\s、，]+/).filter(Boolean);
+  if (!parts.length) { setFavMsg("銘柄のコードを入れてください（例：NFLX、9432）。", true); return; }
+  const codes = [];
+  for (const p of parts) {
+    const c = normalizeCode(p);
+    if (!c) { setFavMsg("「" + p + "」は銘柄コードとして読めません。米国株はアルファベット、日本株は数字4桁です。", true); return; }
+    codes.push(c);
+  }
+  const unknown = codes.filter(c => !state.records.some(r => r.ticker === c));
+  if (unknown.length && !ghConnected()) {
+    setFavMsg(ghRepo()
+      ? "新しい銘柄（" + unknown.join("、") + "）を分析に加えるには、下の手順でGitHubとつなぐ必要があります。"
+      : "新しい銘柄の追加は、GitHubのページ（github.io）で使えます。ここでは、表示中の銘柄に★を付けられます。", true);
+    return;
+  }
+  for (const c of codes) await setFavorite(c, true);
+}
+
+function pendingRow(code) {
+  return h("li", { class: "item pending" },
+    h("span", null, h("span", { class: "star", text: "★" }), h("span", { class: "name", text: code }), h("br"),
+      h("span", { class: "sub", text: "分析待ち（数分後に反映されます。ページを開き直してください）" })),
+    h("button", { class: "btn ghost fav-btn", type: "button", onclick: () => setFavorite(code, false) }, "外す"));
+}
+function favRows() {
+  const set = new Set(state.fav);
+  const known = state.records.filter(r => set.has(r.ticker)).sort((a, b) => (b.score ?? -Infinity) - (a.score ?? -Infinity));
+  const rows = known.map((r, i) => item(r, i + 1));
+  const have = new Set(known.map(r => r.ticker));
+  for (const code of state.fav) if (!have.has(code)) rows.push(pendingRow(code));
+  if (!rows.length) rows.push(h("li", { class: "item" }, h("p", { class: "na", text: "まだお気に入りはありません。ランキングの銘柄を開いて「☆ お気に入りに入れる」を押すか、上の欄にコードを入れてください。" })));
+  return rows;
+}
+
+async function connectGitHub(inputEl) {
+  const token = (inputEl.value || "").trim();
+  if (!token) { setFavMsg("トークンを貼り付けてください。", true); return; }
+  state.gh = { token };
+  try {
+    const res = await ghApi("");
+    if (!res.ok) { const e = new Error("http " + res.status); e.status = res.status; throw e; }
+    const info = await res.json();
+    if (info && info.permissions && info.permissions.push === false) { const e = new Error("readonly"); e.status = 403; throw e; }
+    try { localStorage.setItem(GH_KEY, JSON.stringify({ token })); } catch (e) {}
+    setFavMsg("GitHubとつながりました。");
+    await syncFromGitHub(false);
+    setFavMsg("GitHubとつながりました。これで、銘柄を追加・削除できます。");
+  } catch (e) { state.gh = null; setFavMsg(ghErrorText(e), true); }
+}
+function disconnectGitHub() {
+  state.gh = null;
+  try { localStorage.removeItem(GH_KEY); } catch (e) {}
+  setFavMsg("GitHubとのつながりを解除しました。この端末に保存していたトークンも消しました。");
+}
+
+function favPanels() {
+  const connected = ghConnected();
+  const canConnect = !!ghRepo();
+  const input = h("input", { type: "text", id: "favInput", placeholder: "コードを入力（例：NFLX　9432）", autocomplete: "off", autocapitalize: "characters", "aria-label": "追加する銘柄のコード" });
+  input.addEventListener("keydown", ev => { if (ev.key === "Enter") { ev.preventDefault(); addFromInput(input); } });
+  const main = h("div", { class: "mbox" },
+    h("div", { class: "mbox-top" },
+      h("span", { class: "mbox-title", text: "お気に入り" }),
+      h("span", { class: "chip " + (connected ? "good" : "mid"), text: connected ? "GitHubとつながっています" : "この端末だけ" })),
+    h("p", { text: "気になる銘柄をまとめて見られます。コードを入れて追加すると、数分後から分析の対象になります（日本株は数字4桁、米国株はアルファベット）。" }),
+    h("div", { class: "addrow" }, input, h("button", { class: "btn", type: "button", onclick: () => addFromInput(input) }, "追加")),
+    state.favMsg ? h("p", { class: "fav-msg" + (state.favMsg.err ? " err" : ""), role: "status", text: state.favMsg.text }) : null);
+
+  let conn;
+  if (!canConnect) {
+    conn = h("div", { class: "mbox" }, h("p", { class: "mbox-title", text: "新しい銘柄の追加について" }),
+      h("p", { text: "新しい銘柄を分析に加える機能は、GitHubのページ（github.io）で使えます。ここでは、表示中の銘柄に★を付けることだけができます。" }));
+  } else if (connected) {
+    conn = h("div", { class: "mbox" }, h("p", { class: "mbox-title", text: "GitHubとつながっています" }),
+      h("p", { text: "追加や削除は、GitHubの my_stocks.txt に自動で書き込まれます。ほかの端末や、GitHubで直接書き換えたときは「合わせ直す」を押してください。" }),
+      h("div", { class: "btn-row" },
+        h("button", { class: "btn ghost", type: "button", onclick: () => syncFromGitHub(false) }, "合わせ直す"),
+        h("button", { class: "btn ghost", type: "button", onclick: disconnectGitHub }, "つなぐのをやめる")));
+  } else {
+    const tok = h("input", { type: "password", id: "ghToken", placeholder: "github_pat_… を貼り付け", autocomplete: "off", "aria-label": "GitHubのトークン" });
+    conn = h("div", { class: "mbox" }, h("p", { class: "mbox-title", text: "新しい銘柄を追加できるようにする（最初に1回だけ）" }),
+      h("p", { text: "GitHubとつなぐと、ここから銘柄を追加・削除できます。つなぐには、GitHubで「トークン」（この1つのリポジトリだけを書き換えられる合言葉）を作ります。" }),
+      h("ol", { class: "steps" },
+        h("li", { text: "GitHubの右上の丸いアイコン →「Settings」" }),
+        h("li", { text: "左の一番下「Developer settings」→「Personal access tokens」→「Fine-grained tokens」→「Generate new token」" }),
+        h("li", { text: "Token name は「stock-board」、Expiration は好きな期間（例：1年）" }),
+        h("li", { text: "Repository access は「Only select repositories」を選び、「stock-board」を選ぶ" }),
+        h("li", { text: "Permissions →「Repository permissions」→「Contents」を「Read and write」にする" }),
+        h("li", { text: "「Generate token」を押して、出てきた文字列（github_pat_…）をコピーし、下に貼り付ける" })),
+      h("p", { class: "asof", text: "この文字列はパスワードと同じです。Claudeや他の人には教えないでください。この端末のブラウザの中にだけ保存され、いつでも解除できます。" }),
+      h("div", { class: "addrow" }, tok, h("button", { class: "btn", type: "button", onclick: () => connectGitHub(tok) }, "つなぐ")));
+  }
+  return [main, conn];
+}
+
 /* 起動: まずサンプル。自動更新ページなら埋め込みデータ、そうでなければ保存データを使う */
+initFavState();
 setRecords(sampleRecords(), "sample", null);
 
 function readEmbedded() {
@@ -729,6 +992,7 @@ if (embedded) {
   loadLocal();
   loadShared();
 }
+if (ghConnected()) syncFromGitHub(true);
 </script>
 </body>
 </html>
