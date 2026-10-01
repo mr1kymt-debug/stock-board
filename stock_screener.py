@@ -12,15 +12,26 @@
 
 総合スコア = 上昇の勢い75% + 頭打ちしにくさ25%
 
-分析する銘柄は、下の UNIVERSE（標準の20社）と、my_stocks.txt に書いた「自分の銘柄」の合計です。
+分析する銘柄は、2段階で選びます。
+  1. 東証（日本株）とS&P500（米国株）のほぼ全銘柄を対象に、値動きの勢いだけで順位をつけます
+     （売上や利益までは見ません。値動きだけなら、まとめて速く調べられるためです）
+  2. 各市場で勢いの良かった上位 SHORTLIST_SIZE 社に、UNIVERSE（標準の10社）と
+     my_stocks.txt の「自分の銘柄」を加え、そこだけ詳しく分析します
+     （売上・利益・頭打ちリスクなどは、この詳しい分析でだけ出ます）
+
+全銘柄の一覧が取得できなかったときは、1をスキップし、2の銘柄だけで分析します。
 
 あくまで候補を絞り込む補助ツールで、将来の値上がりを保証するものではありません。
 """
 import datetime
 import json
 import pathlib
+import io
 import re
 import unicodedata
+import warnings
+
+import requests
 
 import numpy as np
 import pandas as pd
@@ -34,6 +45,12 @@ UNIVERSE = {
 }
 MY_STOCKS_FILE = "my_stocks.txt"
 
+# 「市場全体」の一次選抜（値動きの勢いだけで見る、2段階選抜の1段目）
+SHORTLIST_SIZE = 150                 # 各市場で、この上位社数だけを詳しく分析する
+SP500_LIST_URL = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
+JPX_LIST_URL = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls"
+FETCH_TIMEOUT = 30
+BULK_CHUNK = 150                     # 値動きだけをまとめて取得するときの、1回あたりの銘柄数
 # 上昇の勢い（高いほど良い指標）。合計1。仮の値なので、使いながら調整してください
 WEIGHTS = {
     "ret_3m": 0.25,           # 3か月の値上がり率
@@ -44,6 +61,8 @@ WEIGHTS = {
     "earnings_growth": 0.20,  # 利益の伸び
     "pe_improve": 0.05,       # 実績PER÷予想PER（1より大きいと増益予想）
 }
+STAGE1_KEYS = ["ret_3m", "ret_1m", "above_ma200", "volume_ratio"]  # 一次選抜で使う、値動きだけの指標
+STAGE1_WEIGHTS = {k: WEIGHTS[k] for k in STAGE1_KEYS}
 
 # 頭打ちリスク（高いほど頭打ちしやすい指標）。合計1
 PLATEAU_WEIGHTS = {
@@ -160,12 +179,102 @@ def load_my_stocks(path=MY_STOCKS_FILE):
 
 
 def build_universe(extra):
-    """標準の銘柄に、自分の銘柄を足す（重複は1つにまとめる）。"""
-    uni = {m: list(t) for m, t in UNIVERSE.items()}
+    """分析する銘柄を決める。
+    東証・S&P500のほぼ全銘柄を対象に、値動きの勢いだけで一次選抜し（bulk_price_features）、
+    各市場の上位 SHORTLIST_SIZE 社に、標準の銘柄（UNIVERSE）と自分の銘柄（extra）を必ず加える。
+    一覧が取得できない市場は、一次選抜をせず、標準の銘柄＋自分の銘柄だけで進める。
+    """
+    must = {m: set(UNIVERSE[m]) for m in UNIVERSE}
     for code in extra:
-        if code not in uni[market_of(code)]:
-            uni[market_of(code)].append(code)
+        must[market_of(code)].add(code)
+
+    full = {"US": fetch_sp500_universe(), "JP": fetch_tse_universe()}
+    uni = {}
+    for m in UNIVERSE:
+        if full[m]:
+            uni[m] = shortlist_market(m, full[m], must[m])
+        else:
+            uni[m] = sorted(must[m])
     return uni
+
+
+def fetch_sp500_universe():
+    """S&P500の構成銘柄の一覧を取得する（データはWikipediaを整理して配布しているもの）。失敗したら None。"""
+    try:
+        r = requests.get(SP500_LIST_URL, timeout=FETCH_TIMEOUT)
+        r.raise_for_status()
+        codes = []
+        for raw in pd.read_csv(io.StringIO(r.text))["Symbol"]:
+            c = normalize_code(str(raw).replace(".", "-"))  # BRK.B のような表記を BRK-B に合わせる
+            if c:
+                codes.append(c)
+        return sorted(set(codes)) or None
+    except Exception as e:
+        print(f"[警告] S&P500の一覧を取得できませんでした（{e}）。米国株は標準の銘柄だけで進めます。")
+        return None
+
+
+def fetch_tse_universe():
+    """東証の上場銘柄の一覧を取得する（JPXが公開している一覧表）。国内株式だけに絞る。失敗したら None。"""
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        r = requests.get(JPX_LIST_URL, headers=headers, timeout=FETCH_TIMEOUT)
+        r.raise_for_status()
+        buf = io.BytesIO(r.content)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            try:
+                df = pd.read_excel(buf, engine="xlrd")
+            except Exception:
+                buf.seek(0)
+                df = pd.read_excel(buf, engine="openpyxl")
+        market_col = next((c for c in df.columns if "市場" in str(c) and "商品" in str(c)), None)
+        code_col = next((c for c in df.columns if "コード" == str(c).strip()), None)
+        if market_col is None or code_col is None:
+            raise ValueError("想定した列（コード／市場・商品区分）が見つかりません")
+        stock = df[df[market_col].astype(str).str.contains("内国株式", na=False)]
+        codes = [normalize_code(str(c)) for c in stock[code_col]]
+        return sorted({c for c in codes if c}) or None
+    except Exception as e:
+        print(f"[警告] 東証の銘柄一覧を取得できませんでした（{e}）。日本株は標準の銘柄だけで進めます。")
+        return None
+
+
+def bulk_price_features(tickers):
+    """多くの銘柄の、値動きの指標だけをまとめて取得する（売上や利益は見ない、一次選抜用）。"""
+    rows = []
+    uniq = sorted(set(tickers))
+    for i in range(0, len(uniq), BULK_CHUNK):
+        chunk = uniq[i : i + BULK_CHUNK]
+        print(f"  値動きを取得中: {i + 1}〜{i + len(chunk)} / {len(uniq)}")
+        try:
+            raw = yf.download(chunk, period="1y", auto_adjust=True, progress=False, group_by="column", threads=True)
+        except Exception as e:
+            print(f"  [警告] この{len(chunk)}件の取得に失敗しました（{e}）。飛ばします。")
+            continue
+        if raw is None or raw.empty:
+            continue
+        close_all = raw["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw[["Close"]].rename(columns={"Close": chunk[0]})
+        volume_all = raw["Volume"] if isinstance(raw.columns, pd.MultiIndex) else raw[["Volume"]].rename(columns={"Volume": chunk[0]})
+        for t in chunk:
+            if t not in close_all.columns:
+                continue
+            f = compute_price_features(pd.DataFrame({"Close": close_all[t], "Volume": volume_all.get(t)}).dropna(how="all"))
+            rows.append({"ticker": t, **{k: f.get(k) for k in STAGE1_KEYS}})
+    return pd.DataFrame(rows).set_index("ticker") if rows else pd.DataFrame(columns=STAGE1_KEYS)
+
+
+def shortlist_market(market, full_list, must_include):
+    """値動きの勢いだけで一次選抜し、上位 SHORTLIST_SIZE 社（＋必ず入れる銘柄）を返す。"""
+    candidates = sorted(set(full_list) | set(must_include))
+    feats = bulk_price_features(candidates)
+    if feats.empty:
+        return sorted(set(must_include))
+    score = sum(w * feats[c].rank(pct=True).fillna(0.5) for c, w in STAGE1_WEIGHTS.items())
+    ranked = score.sort_values(ascending=False).index.tolist()
+    top = ranked[:SHORTLIST_SIZE]
+    print(f"  {market}: 全{len(candidates)}銘柄のうち、値動きの勢いで上位{len(top)}銘柄を選びました")
+    return sorted(set(top) | set(must_include))
 
 
 def load_news(path=NEWS_FILE, today=None):

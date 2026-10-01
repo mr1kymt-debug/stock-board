@@ -1,2 +1,5 @@
 yfinance
 pandas
+requests
+xlrd<2
+openpyxl
