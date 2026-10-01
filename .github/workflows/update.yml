@@ -22,15 +22,17 @@ concurrency:
 jobs:
   update:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: main            # 順番待ちのあとでも、いちばん新しい状態から始める
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      # requirements.txt には頼らず、この仕組みに必要なものだけを入れる
-      - run: pip install yfinance pandas
+      - run: pip install -r requirements.txt
 
       - name: スコアを計算
         run: python stock_screener.py
@@ -38,11 +40,15 @@ jobs:
       - name: ページを作成（取得失敗が多いときはここで止まり、公開中のページは更新されない）
         run: python build_page.py
 
-      - name: 変更を保存
+      - name: 変更を保存（更新が重なって食い違っても、新しい結果を優先してやり直す）
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add screener_result.csv docs/index.html
           git diff --cached --quiet || git commit -m "update stock screener $(date -u +%F)"
-          git pull --rebase
-          git push
+          for i in 1 2 3; do
+            git pull --rebase -X theirs && git push && exit 0
+            git rebase --abort 2>/dev/null || true
+            sleep 5
+          done
+          exit 1
