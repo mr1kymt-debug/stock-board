@@ -63,6 +63,7 @@ WEIGHTS = {
 }
 STAGE1_KEYS = ["ret_3m", "ret_1m", "above_ma200", "volume_ratio"]  # 一次選抜で使う、値動きだけの指標
 STAGE1_WEIGHTS = {k: WEIGHTS[k] for k in STAGE1_KEYS}
+TICKER_NAMES = {}  # 銘柄コード→会社名。一覧の取得時に分かったぶんを覚えておく
 
 # 頭打ちリスク（高いほど頭打ちしやすい指標）。合計1
 PLATEAU_WEIGHTS = {
@@ -133,6 +134,9 @@ def fetch_features(ticker: str) -> dict:
         t = yf.Ticker(ticker)
         feats.update(compute_price_features(t.history(period="1y")))
         info = t.info
+        name = TICKER_NAMES.get(ticker) or info.get("shortName") or info.get("longName")
+        if name:
+            feats["name"] = name
         feats["revenue_growth"] = info.get("revenueGrowth")
         feats["earnings_growth"] = info.get("earningsGrowth")
         trailing, forward = info.get("trailingPE"), info.get("forwardPE")
@@ -204,10 +208,11 @@ def fetch_sp500_universe():
         r = requests.get(SP500_LIST_URL, timeout=FETCH_TIMEOUT)
         r.raise_for_status()
         codes = []
-        for raw in pd.read_csv(io.StringIO(r.text))["Symbol"]:
-            c = normalize_code(str(raw).replace(".", "-"))  # BRK.B のような表記を BRK-B に合わせる
+        for _, row in pd.read_csv(io.StringIO(r.text))[["Symbol", "Security"]].iterrows():
+            c = normalize_code(str(row["Symbol"]).replace(".", "-"))  # BRK.B のような表記を BRK-B に合わせる
             if c:
                 codes.append(c)
+                TICKER_NAMES.setdefault(c, str(row["Security"]).strip())
         return sorted(set(codes)) or None
     except Exception as e:
         print(f"[警告] S&P500の一覧を取得できませんでした（{e}）。米国株は標準の銘柄だけで進めます。")
@@ -232,8 +237,15 @@ def _fetch_tse_universe_from(url):
     if market_col is None or code_col is None:
         raise ValueError("想定した列（コード／市場・商品区分）が見つかりません")
     stock = df[df[market_col].astype(str).str.contains("内国株式", na=False)]
-    codes = [normalize_code(str(c)) for c in stock[code_col]]
-    return sorted({c for c in codes if c}) or None
+    name_col = next((c for c in df.columns if "銘柄名" == str(c).strip()), None)
+    codes = []
+    for _, row in stock.iterrows():
+        c = normalize_code(str(row[code_col]))
+        if c:
+            codes.append(c)
+            if name_col is not None:
+                TICKER_NAMES.setdefault(c, str(row[name_col]).strip())
+    return sorted(set(codes)) or None
 
 
 def fetch_tse_universe():

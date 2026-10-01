@@ -284,13 +284,14 @@ function recordsFromCSV(text) {
   const iTicker = col("ticker") >= 0 ? col("ticker") : 0;
   const num = (r, n) => col(n) >= 0 ? toNum(r[col(n)]) : null;
   const str = (r, n) => col(n) >= 0 ? ((r[col(n)] || "").trim() || null) : null;
+  const esc = s => s == null ? s : s.replace(/""/g, '"');
   const out = [];
   for (const r of rows.slice(1)) {
     const f = {};
     for (const fac of FACTORS) f[fac.key] = num(r, fac.key);
     out.push({
       ticker: (r[iTicker] || "").trim(), market: (r[iMarket] || "").trim(), score: toNum(r[iScore]), f,
-      outlook: str(r, "outlook"), risk: num(r, "plateau_risk"), rising: num(r, "rising_score"),
+      name: esc(str(r, "name")), outlook: str(r, "outlook"), risk: num(r, "plateau_risk"), rising: num(r, "rising_score"),
       price: num(r, "price"), rangeLow: num(r, "range_low"), rangeHigh: num(r, "range_high"),
       wideLow: num(r, "wide_low"), wideHigh: num(r, "wide_high"),
       direction: str(r, "direction"), newsTone: str(r, "news_tone"), marketTone: str(r, "market_tone"),
@@ -464,7 +465,7 @@ function safeUrl(u) {
 }
 function marketOf(t) { return /\.T$/.test(t) ? "JP" : "US"; }
 function newsOf(t) { return state.news && state.news.tickers ? state.news.tickers[t] || null : null; }
-function nameOf(t) { const n = newsOf(t); return n && n.name ? n.name : null; }
+function nameOf(r) { const t = typeof r === "string" ? r : r.ticker; const fromCsv = typeof r === "object" ? r.name : null; const n = newsOf(t); return fromCsv || (n && n.name ? n.name : null); }
 function newsAgeDays() {
   if (!state.news || !state.news.asOf) return null;
   const t = Date.parse(state.news.asOf + "T00:00:00");
@@ -593,7 +594,7 @@ function newsCard(t) {
 function item(r, place) {
   const isOpen = state.open === r.ticker;
   const three = r.f.ret_3m;
-  const nm = nameOf(r.ticker);
+  const nm = nameOf(r);
   const sub = h("span", null,
     three == null ? "3か月の値上がり率 データなし" : ["3か月 ", h("span", { class: signClass("pct", three), text: fmtVal("pct", three) })],
     r.direction ? h("span", { class: "dir", text: "1か月の見立て " + r.direction }) : null);
