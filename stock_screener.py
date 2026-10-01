@@ -48,7 +48,7 @@ MY_STOCKS_FILE = "my_stocks.txt"
 # 「市場全体」の一次選抜（値動きの勢いだけで見る、2段階選抜の1段目）
 SHORTLIST_SIZE = 150                 # 各市場で、この上位社数だけを詳しく分析する
 SP500_LIST_URL = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
-JPX_LIST_URL = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls"
+JPX_LIST_URL = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xlsx"  # JPXは拡張子を変えることがあるので、取得に失敗したら自動で.xlsに切り替える
 FETCH_TIMEOUT = 30
 BULK_CHUNK = 150                     # 値動きだけをまとめて取得するときの、1回あたりの銘柄数
 # 上昇の勢い（高いほど良い指標）。合計1。仮の値なので、使いながら調整してください
@@ -214,28 +214,40 @@ def fetch_sp500_universe():
         return None
 
 
+def _fetch_tse_universe_from(url):
+    """指定したURLからJPXの一覧表を読み込み、国内株式のコード一覧を返す（内部用、例外はそのまま投げる）。"""
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    r = requests.get(url, headers=headers, timeout=FETCH_TIMEOUT)
+    r.raise_for_status()
+    buf = io.BytesIO(r.content)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        try:
+            df = pd.read_excel(buf, engine="openpyxl")   # 現在の形式（.xlsx）
+        except Exception:
+            buf.seek(0)
+            df = pd.read_excel(buf, engine="xlrd")        # 以前の形式（.xls）だった場合の保険
+    market_col = next((c for c in df.columns if "市場" in str(c) and "商品" in str(c)), None)
+    code_col = next((c for c in df.columns if "コード" == str(c).strip()), None)
+    if market_col is None or code_col is None:
+        raise ValueError("想定した列（コード／市場・商品区分）が見つかりません")
+    stock = df[df[market_col].astype(str).str.contains("内国株式", na=False)]
+    codes = [normalize_code(str(c)) for c in stock[code_col]]
+    return sorted({c for c in codes if c}) or None
+
+
 def fetch_tse_universe():
     """東証の上場銘柄の一覧を取得する（JPXが公開している一覧表）。国内株式だけに絞る。失敗したら None。"""
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-        r = requests.get(JPX_LIST_URL, headers=headers, timeout=FETCH_TIMEOUT)
-        r.raise_for_status()
-        buf = io.BytesIO(r.content)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            try:
-                df = pd.read_excel(buf, engine="xlrd")
-            except Exception:
-                buf.seek(0)
-                df = pd.read_excel(buf, engine="openpyxl")
-        market_col = next((c for c in df.columns if "市場" in str(c) and "商品" in str(c)), None)
-        code_col = next((c for c in df.columns if "コード" == str(c).strip()), None)
-        if market_col is None or code_col is None:
-            raise ValueError("想定した列（コード／市場・商品区分）が見つかりません")
-        stock = df[df[market_col].astype(str).str.contains("内国株式", na=False)]
-        codes = [normalize_code(str(c)) for c in stock[code_col]]
-        return sorted({c for c in codes if c}) or None
+        return _fetch_tse_universe_from(JPX_LIST_URL)
     except Exception as e:
+        # JPXはファイルの拡張子（.xls / .xlsx）を、月によって変えることがあるため、もう一方を1回だけ試す
+        alt = JPX_LIST_URL.replace(".xlsx", ".xls") if JPX_LIST_URL.endswith(".xlsx") else JPX_LIST_URL.replace(".xls", ".xlsx")
+        if alt != JPX_LIST_URL:
+            try:
+                return _fetch_tse_universe_from(alt)
+            except Exception:
+                pass
         print(f"[警告] 東証の銘柄一覧を取得できませんでした（{e}）。日本株は標準の銘柄だけで進めます。")
         return None
 
