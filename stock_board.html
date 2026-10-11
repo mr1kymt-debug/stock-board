@@ -201,6 +201,7 @@
   <div id="mbox"></div>
   <ol class="list" id="list"></ol>
   <div id="newsView" hidden></div>
+  <div id="accView" hidden></div>
 
   <details class="data" id="dataBox" open>
     <summary>データを読み込む</summary>
@@ -229,8 +230,8 @@
 <script>
 /* ---- pure: データ処理 ---- */
 const FACTORS = [
-  { key: "ret_3m",          label: "3か月の値上がり率",                     kind: "pct",   group: "up" },
   { key: "ret_1m",          label: "1か月の値上がり率",                     kind: "pct",   group: "up" },
+  { key: "ret_1w",          label: "直近1週間の値上がり率",                   kind: "pct",   group: "up" },
   { key: "above_ma200",     label: "約10か月の平均株価との差",               kind: "pct",   group: "up" },
   { key: "volume_ratio",    label: "最近の取引の活発さ（直近5日÷60日）",      kind: "ratio", group: "up" },
   { key: "revenue_growth",  label: "売上の伸び",                            kind: "pct",   group: "up" },
@@ -353,10 +354,10 @@ function directionLabel(p) {
 }
 
 /* サンプル用（架空データ）。スコアの計算はプログラム本体と同じ考え方 */
-const SAMPLE_WEIGHTS = { ret_3m: .25, ret_1m: .10, above_ma200: .10, volume_ratio: .10, revenue_growth: .20, earnings_growth: .20, pe_improve: .05 };
+const SAMPLE_WEIGHTS = { ret_1m: .25, ret_1w: .10, above_ma200: .10, volume_ratio: .10, revenue_growth: .20, earnings_growth: .20, pe_improve: .05 };
 const SAMPLE_RISK_WEIGHTS = { rsi14: .30, slowdown: .30, forward_pe: .25, volume_ratio: .15 };
 function sampleRecords() {
-  const keys = ["ret_1m", "ret_3m", "above_ma200", "volume_ratio", "revenue_growth", "earnings_growth", "pe_improve", "rsi14", "forward_pe", "price", "vol_1m"];
+  const keys = ["ret_1w", "ret_1m", "above_ma200", "volume_ratio", "revenue_growth", "earnings_growth", "pe_improve", "rsi14", "forward_pe", "price", "vol_1m"];
   const raw = [
     ["JP", "DEMO-J1", .020, .118, .15, 1.35, .12, .25, 1.18, 66, 24, 2400, .09],
     ["JP", "DEMO-J2", -.015, .031, .04, .92, .05, .08, 1.04, 48, 15, 1800, .07],
@@ -371,7 +372,7 @@ function sampleRecords() {
   ];
   const recs = raw.map(([market, ticker, ...vals]) => {
     const f = {}; keys.forEach((k, i) => f[k] = vals[i]);
-    f.slowdown = f.ret_3m / 3 - f.ret_1m;
+    f.slowdown = f.ret_1m / (22 / 5) - f.ret_1w;   // 1か月(22営業日)を週数に換算して比べる
     return { ticker, market, score: null, f };
   });
   const byMarket = enrich(recs);
@@ -386,7 +387,7 @@ function sampleRecords() {
       }
       r.rising = Math.round(rising * 1000) / 10;
       r.risk = Math.round(risk * 1000) / 10;
-      r.outlook = !(r.f.ret_3m > 0 && r.f.above_ma200 > 0) ? "上昇していない"
+      r.outlook = !(r.f.ret_1m > 0 && r.f.above_ma200 > 0) ? "上昇していない"
         : r.risk >= 67 ? "頭打ち注意" : r.risk <= 33 ? "上昇継続の可能性" : "様子見";
       r.score = Math.round((0.75 * r.rising + 0.25 * (100 - r.risk)) * 10) / 10;
       r.direction = directionLabel(directionPoints(r.score, r.outlook, null, null));
@@ -441,7 +442,8 @@ function removeFromMyStocks(text, code) {
 /* ---- ui ---- */
 const STORE_KEY = "screener:v1";
 const NEWS_KEY = "screener:news:v1";
-const state = { records: [], byMarket: {}, market: null, open: null, source: "sample", updatedAt: null, news: null, fav: [], favSeeded: false, favStored: false, favMsg: null, gh: null };
+const ACC_KEY = "screener:accuracy:v1";
+const state = { records: [], byMarket: {}, market: null, open: null, source: "sample", updatedAt: null, news: null, accuracy: null, fav: [], favSeeded: false, favStored: false, favMsg: null, gh: null };
 const FAV_KEY = "screener:fav:v1";
 const GH_KEY = "screener:gh:v1";
 let dbRef = null;
@@ -492,6 +494,8 @@ function setRecords(records, source, updatedAt) {
 }
 function validNews(o) { return !!(o && typeof o === "object" && o.tickers && typeof o.tickers === "object"); }
 function setNews(n) { state.news = n; render(); }
+function validAccuracy(o) { return !!(o && typeof o === "object" && o.overall && typeof o.overall.n === "number"); }
+function setAccuracy(a) { state.accuracy = a; render(); }
 
 function sourceLinks(list) {
   const links = (list || []).map(s => ({ t: s && s.title, u: s && safeUrl(s.url) })).filter(x => x.u);
@@ -534,25 +538,40 @@ function render() {
     class: "tab", role: "tab", id: "tab-news", "aria-selected": String(state.market === "news"),
     onclick: () => { state.market = "news"; state.open = null; render(); }
   }, "ニュース"));
+  if (state.accuracy && state.accuracy.overall && state.accuracy.overall.n > 0) tabEls.push(h("button", {
+    class: "tab", role: "tab", id: "tab-acc", "aria-selected": String(state.market === "acc"),
+    onclick: () => { state.market = "acc"; state.open = null; render(); }
+  }, "成績"));
   tabs.replaceChildren(...tabEls);
 
   if (state.market === "news" && state.news) {
     $("mbox").replaceChildren();
     $("list").hidden = true;
     $("newsView").hidden = false;
+    $("accView").hidden = true;
     renderNews();
+    return;
+  }
+  if (state.market === "acc" && state.accuracy) {
+    $("mbox").replaceChildren();
+    $("list").hidden = true;
+    $("newsView").hidden = true;
+    $("accView").hidden = false;
+    renderAccuracy();
     return;
   }
   if (state.market === "fav") {
     $("list").hidden = false;
     $("newsView").hidden = true;
+    $("accView").hidden = true;
     $("mbox").replaceChildren(...favPanels());
     $("list").replaceChildren(...favRows());
     return;
   }
-  if (state.market === "news") state.market = Object.keys(state.byMarket)[0];
+  if (state.market === "news" || state.market === "acc") state.market = Object.keys(state.byMarket)[0];
   $("list").hidden = false;
   $("newsView").hidden = true;
+  $("accView").hidden = true;
   const box = marketBox(state.market);
   $("mbox").replaceChildren(...(box ? [box] : []));
   const list = (state.byMarket[state.market] || []).slice()
@@ -579,6 +598,49 @@ function renderNews() {
   view.replaceChildren(...els);
 }
 
+const DIR_BUCKET_TEXT = { "上": "上向き", "下": "下向き", "横ばい": "横ばい" };
+function pct(v) { return v == null ? "―" : Math.round(v * 100) + "%"; }
+
+function accSummaryBox(label, s) {
+  if (!s || !s.n) return null;
+  return h("div", { class: "mbox" },
+    h("div", { class: "mbox-top" }, h("span", { class: "mbox-title", text: label })),
+    h("div", { class: "sum" },
+      h("div", null, h("span", { class: "stat-l", text: "件数" }), h("span", { class: "stat-v", text: String(s.n) })),
+      h("div", null, h("span", { class: "stat-l", text: "方向の正答率" }), h("span", { class: "stat-v", text: pct(s.directionAccuracy) })),
+      h("div", null, h("span", { class: "stat-l", text: "よくある範囲に収まった率" }), h("span", { class: "stat-v", text: pct(s.inRangeRate) }))));
+}
+
+function renderAccuracy() {
+  const view = $("accView");
+  const a = state.accuracy;
+  const els = [];
+  els.push(h("p", { class: "fc-why" },
+    "約1か月前に出した「1か月後の見立て」が、実際の値動きと合っていたかを答え合わせしています。方向（上向き・下向き・横ばい）が当たったかと、「よくある範囲」の目安に収まったかを見ています。"));
+  els.push(accSummaryBox("全体の成績", a.overall));
+  for (const m of ["JP", "US"]) {
+    const s = a.byMarket && a.byMarket[m];
+    const box = accSummaryBox((MARKET_NAME[m] || m) + "の成績", s);
+    if (box) els.push(box);
+  }
+  if (a.recent && a.recent.length) {
+    els.push(h("p", { class: "news-head", text: "直近の答え合わせ" }));
+    for (const r of a.recent) {
+      const ret = r.actual_return == null || r.actual_return === "" ? null : Number(r.actual_return);
+      const ok = Number(r.direction_correct) === 1;
+      els.push(h("div", { class: "fc-row" },
+        h("span", { class: "fc-l" },
+          (r.name || r.ticker) + "（" + r.ticker + "）　",
+          h("span", { class: "chip", text: r.direction || "" })),
+        h("span", { class: "fc-v" },
+          h("span", { class: signClass("pct", ret), text: ret == null ? "―" : fmtVal("pct", ret) }),
+          h("span", { class: "chip " + (ok ? "good" : "warn"), text: ok ? "的中" : "外れ" }))));
+    }
+  }
+  els.push(h("p", { class: "note", text: (a.updatedAt ? "更新 " + new Date(a.updatedAt).toLocaleDateString("ja-JP") + "　／　" : "") + "方向は±2%未満を「横ばい」として判定しています。件数が少ないうちは、参考程度にご覧ください。" }));
+  view.replaceChildren(...els);
+}
+
 function newsCard(t) {
   const n = newsOf(t);
   return h("article", { class: "ncard" },
@@ -593,10 +655,10 @@ function newsCard(t) {
 
 function item(r, place) {
   const isOpen = state.open === r.ticker;
-  const three = r.f.ret_3m;
+  const oneMonth = r.f.ret_1m;
   const nm = nameOf(r);
   const sub = h("span", null,
-    three == null ? "3か月の値上がり率 データなし" : ["3か月 ", h("span", { class: signClass("pct", three), text: fmtVal("pct", three) })],
+    oneMonth == null ? "1か月の値上がり率 データなし" : ["1か月 ", h("span", { class: signClass("pct", oneMonth), text: fmtVal("pct", oneMonth) })],
     r.direction ? h("span", { class: "dir", text: "1か月の見立て " + r.direction }) : null);
   const chip = r.outlook ? h("span", { class: "chip " + (r.outlook === "頭打ち注意" ? "warn" : r.outlook === "上昇継続の可能性" ? "good" : "mid"), text: r.outlook }) : null;
   const row = h("button", {
@@ -956,6 +1018,10 @@ function loadLocal() {
     const news = JSON.parse(localStorage.getItem(NEWS_KEY) || "null");
     if (validNews(news)) setNews(news);
   } catch (e) {}
+  try {
+    const acc = JSON.parse(localStorage.getItem(ACC_KEY) || "null");
+    if (validAccuracy(acc)) setAccuracy(acc);
+  } catch (e) {}
 }
 async function loadShared() {
   try {
@@ -986,6 +1052,10 @@ const embedded = readEmbedded();
 if (embedded) {
   try {
     if (validNews(embedded.news)) state.news = embedded.news;
+    if (validAccuracy(embedded.accuracy)) {
+      state.accuracy = embedded.accuracy;
+      try { localStorage.setItem(ACC_KEY, JSON.stringify(embedded.accuracy)); } catch (e) {}
+    }
     setRecords(recordsFromCSV(embedded.csv), "csv", embedded.updatedAt);
     $("dataBox").hidden = true;   // 自動更新ページでは手動の読み込み欄は不要
   } catch (e) { loadLocal(); loadShared(); }

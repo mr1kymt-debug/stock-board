@@ -53,22 +53,22 @@ FETCH_TIMEOUT = 30
 BULK_CHUNK = 150                     # 値動きだけをまとめて取得するときの、1回あたりの銘柄数
 # 上昇の勢い（高いほど良い指標）。合計1。仮の値なので、使いながら調整してください
 WEIGHTS = {
-    "ret_3m": 0.25,           # 3か月の値上がり率
-    "ret_1m": 0.10,           # 1か月の値上がり率
+    "ret_1m": 0.25,           # 1か月の値上がり率
+    "ret_1w": 0.10,           # 直近1週間の値上がり率
     "above_ma200": 0.10,      # 約10か月の平均株価との差（長い目で見た上昇傾向）
     "volume_ratio": 0.10,      # 直近5日÷60日の取引量（注目度の変化）
     "revenue_growth": 0.20,   # 売上の伸び
     "earnings_growth": 0.20,  # 利益の伸び
     "pe_improve": 0.05,       # 実績PER÷予想PER（1より大きいと増益予想）
 }
-STAGE1_KEYS = ["ret_3m", "ret_1m", "above_ma200", "volume_ratio"]  # 一次選抜で使う、値動きだけの指標
+STAGE1_KEYS = ["ret_1m", "ret_1w", "above_ma200", "volume_ratio"]  # 一次選抜で使う、値動きだけの指標
 STAGE1_WEIGHTS = {k: WEIGHTS[k] for k in STAGE1_KEYS}
 TICKER_NAMES = {}  # 銘柄コード→会社名。一覧の取得時に分かったぶんを覚えておく
 
 # 頭打ちリスク（高いほど頭打ちしやすい指標）。合計1
 PLATEAU_WEIGHTS = {
     "rsi14": 0.30,         # 買われすぎ度（0〜100。70超は過熱ぎみ）
-    "slowdown": 0.30,      # 上昇ペースの鈍り（3か月の月平均ペース − 直近1か月）
+    "slowdown": 0.30,      # 上昇ペースの鈍り（1か月の週平均ペース − 直近1週間）
     "forward_pe": 0.25,    # 株価は今後の利益の何倍か（高いほど割高）
     "volume_ratio": 0.15,  # 取引の細り（取引量が少ないほどリスク大）
 }
@@ -86,6 +86,14 @@ TICKER_NEWS_WEIGHT = 0.75                           # 個別銘柄のニュー�
 MARKET_NEWS_WEIGHT = 0.50                           # 市場全体の状況の効き方
 PLATEAU_PENALTY = 0.5                               # 「頭打ち注意」のときの減点
 TRADING_DAYS_1M = 21                                # 1か月の営業日数
+TRADING_DAYS_1W = 5                                 # 1週間の営業日数
+
+# 予測の記録（あとで答え合わせをするための下書き。check_predictions.py が使う）
+PREDICTIONS_LOG_FILE = "predictions_log.csv"
+PREDICTIONS_LOG_COLUMNS = [
+    "ticker", "date", "market", "name", "score", "direction",
+    "price", "range_low", "range_high", "wide_low", "wide_high",
+]
 
 
 def compute_rsi(close: pd.Series, n: int = 14) -> float:
@@ -105,10 +113,10 @@ def compute_price_features(hist: pd.DataFrame) -> dict:
     feats = {}
     if len(close) >= 1:
         feats["price"] = float(close.iloc[-1])
+    if len(close) >= TRADING_DAYS_1W + 1:
+        feats["ret_1w"] = close.iloc[-1] / close.iloc[-(TRADING_DAYS_1W + 1)] - 1
     if len(close) >= 22:
         feats["ret_1m"] = close.iloc[-1] / close.iloc[-22] - 1
-    if len(close) >= 64:
-        feats["ret_3m"] = close.iloc[-1] / close.iloc[-64] - 1
     if len(close) >= 200:
         feats["above_ma200"] = close.iloc[-1] / close.rolling(200).mean().iloc[-1] - 1
     if len(volume) >= 60 and volume.tail(60).mean() > 0:
@@ -117,8 +125,9 @@ def compute_price_features(hist: pd.DataFrame) -> dict:
         rsi = compute_rsi(close)
         if np.isfinite(rsi):
             feats["rsi14"] = rsi
-    if "ret_1m" in feats and "ret_3m" in feats:
-        feats["slowdown"] = feats["ret_3m"] / 3 - feats["ret_1m"]
+    if "ret_1w" in feats and "ret_1m" in feats:
+        weeks_in_1m = 22 / TRADING_DAYS_1W   # 1か月(22営業日)を週数に換算
+        feats["slowdown"] = feats["ret_1m"] / weeks_in_1m - feats["ret_1w"]
     if len(close) >= 60:
         # 過去約1年の日々の値動きの大きさ → 1か月分に換算
         daily = np.log(close).diff().dropna().tail(252).std()
@@ -340,7 +349,7 @@ def direction_label(points: float) -> str:
 def build_scores(df: pd.DataFrame, news=None) -> pd.DataFrame:
     """上昇の勢い・頭打ちリスク・総合スコア・1か月後の見立てを計算する。"""
     df = df.copy()
-    for col in set(WEIGHTS) | set(PLATEAU_WEIGHTS) | {"ret_3m", "above_ma200", "price", "vol_1m"}:
+    for col in set(WEIGHTS) | set(PLATEAU_WEIGHTS) | {"ret_1m", "above_ma200", "price", "vol_1m"}:
         if col not in df.columns:
             df[col] = np.nan
 
@@ -349,8 +358,8 @@ def build_scores(df: pd.DataFrame, news=None) -> pd.DataFrame:
     df["rising_score"] = (rising * 100).round(1)
     df["plateau_risk"] = (risk * 100).round(1)
 
-    known = df["ret_3m"].notna() & df["above_ma200"].notna()
-    is_rising = (df["ret_3m"] > 0) & (df["above_ma200"] > 0)
+    known = df["ret_1m"].notna() & df["above_ma200"].notna()
+    is_rising = (df["ret_1m"] > 0) & (df["above_ma200"] > 0)
     df["outlook"] = np.select(
         [~known, ~is_rising, df["plateau_risk"] >= HIGH_RISK, df["plateau_risk"] <= LOW_RISK],
         ["判定できない", "上昇していない", "頭打ち注意", "上昇継続の可能性"],
@@ -382,6 +391,37 @@ def build_scores(df: pd.DataFrame, news=None) -> pd.DataFrame:
     return df.sort_values(["market", "score"], ascending=[True, False])
 
 
+def log_predictions(df: pd.DataFrame, today=None, path=PREDICTIONS_LOG_FILE):
+    """今日の見立てを predictions_log.csv に積み上げる（check_predictions.py が約1か月後に答え合わせする）。
+    同じ日・同じ銘柄の記録がすでにあれば、二重には書き込まない（同じ日に2回実行しても安全）。
+    """
+    today = today or datetime.date.today().isoformat()
+    new = df.reset_index().rename(columns={"index": "ticker"})
+    new = new[new["price"].notna() & new["direction"].notna()].copy()
+    if new.empty:
+        print("[情報] 記録できる見立てがありませんでした（株価が取れた銘柄がないため）。")
+        return
+    new.insert(1, "date", today)
+    for col in PREDICTIONS_LOG_COLUMNS:
+        if col not in new.columns:
+            new[col] = ""
+    new = new[PREDICTIONS_LOG_COLUMNS].astype(str)
+
+    p = pathlib.Path(path)
+    if p.exists():
+        existing = pd.read_csv(p, dtype=str)
+        done = set(zip(existing["date"], existing["ticker"]))
+        new = new[~new.apply(lambda r: (r["date"], r["ticker"]) in done, axis=1)]
+        if new.empty:
+            print(f"[情報] {today} 分の予測はすでに記録済みです。")
+            return
+        combined = pd.concat([existing, new], ignore_index=True)
+    else:
+        combined = new
+    combined.to_csv(p, index=False, encoding="utf-8-sig")
+    print(f"{path} に {len(new)} 件の予測を記録しました（累計 {len(combined)} 件）")
+
+
 def main():
     news = load_news()
     mine = load_my_stocks()
@@ -393,6 +433,7 @@ def main():
             print(f"取得中: {ticker}")
             rows.append({"ticker": ticker, "market": market, "mine": int(ticker in mine), **fetch_features(ticker)})
     result = build_scores(pd.DataFrame(rows).set_index("ticker"), news)
+    log_predictions(result)
 
     pd.set_option("display.float_format", lambda x: f"{x:,.1f}")
     print("\n=== ランキング（市場別） ===")
