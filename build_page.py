@@ -13,12 +13,13 @@ import sys
 
 CSV_PATH = pathlib.Path("screener_result.csv")
 NEWS_PATH = pathlib.Path("news_view.json")
+ACCURACY_PATH = pathlib.Path("accuracy.json")
 TEMPLATE = pathlib.Path("stock_board.html")
 OUT = pathlib.Path("docs/index.html")
 
 text = CSV_PATH.read_text(encoding="utf-8-sig")
 rows = list(csv.DictReader(io.StringIO(text)))
-with_prices = [r for r in rows if r.get("ret_3m")]
+with_prices = [r for r in rows if r.get("ret_1m")]
 if not rows or len(with_prices) < len(rows) * 0.5:
     sys.exit(f"株価を取得できた銘柄が少なすぎます（{len(with_prices)}/{len(rows)}）。更新を中止しました。")
 
@@ -28,6 +29,11 @@ if NEWS_PATH.exists():
         payload["news"] = json.loads(NEWS_PATH.read_text(encoding="utf-8"))
     except Exception as e:
         print(f"[警告] news_view.json を読み込めなかったため、ニュースなしで作成します: {e}")
+if ACCURACY_PATH.exists():
+    try:
+        payload["accuracy"] = json.loads(ACCURACY_PATH.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"[警告] accuracy.json を読み込めなかったため、成績なしで作成します: {e}")
 data_json = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
 block = f'<script id="embedded" type="application/json">{data_json}</script>'
 
@@ -39,4 +45,4 @@ html = html.replace("<head>", '<head>\n<meta name="robots" content="noindex">', 
 
 OUT.parent.mkdir(exist_ok=True)
 OUT.write_text(html, encoding="utf-8")
-print(f"{OUT} を作成しました（{len(rows)}銘柄、ニュース{'あり' if 'news' in payload else 'なし'}）")
+print(f"{OUT} を作成しました（{len(rows)}銘柄、ニュース{'あり' if 'news' in payload else 'なし'}、成績{'あり' if 'accuracy' in payload else 'なし'}）")
